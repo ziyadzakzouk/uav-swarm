@@ -2,6 +2,11 @@
 #include <map>
 #include "Vec2.h"
 #include "StateMsg_m.h"
+#include "EvidenceMsg_m.h"
+#include <set>
+#include <functional>
+#include <string>
+#include <vector>
 #include <algorithm>
 
 using namespace omnetpp;
@@ -70,6 +75,12 @@ class UAV : public cSimpleModule
         simtime_t truthSince;        // first message that carried a spoofed fix
         bool detectedPers = false;
         bool detectedCusum = false;
+
+        // Step C: values of the sample an event was raised on
+        Sample evSample;             // target's reported position / velocity
+        double evRMot = 0, evRRel = 0;
+        bool   evSentBefore = false; // has an evidence package been sent yet?
+        simtime_t lastEvidence;      // when the last package was sent
     };
     std::map<int, NeighborState> neighbors;
     Anchor selfAnchor;           // anchor for the UAV's own track
@@ -84,6 +95,23 @@ class UAV : public cSimpleModule
     simsignal_t cusumStatSig, persistRunSig, obsSpoofedEventSig;
 
     void resetDetectors(NeighborState &s);
+
+    // ---- Stage 2.2 Step 4: evidence package ----
+    simtime_t evidenceCooldown;  // min. time between packages about one target
+    simtime_t sigDelay;          // modelled time to sign a package
+    simtime_t maxEvidenceAge;    // leader: freshness limit
+    int leaderPort = -1;         // port gate towards the leader (-1 = I am the leader)
+
+    simsignal_t evSentSig, evSuppressedSig, evAcceptedSig, evRejectedSig,
+                evLatencySig, evObserversSig;
+
+    // leader only: who has accused whom (target -> observer -> last package time)
+    std::map<int, std::map<int, simtime_t>> evidenceBy;
+    std::vector<EvidenceMsg *> pendingEvidence;   // accepted, waiting for Phase 3
+
+    uint64_t computeSignature(const EvidenceMsg *ev, int signerId) const;
+    void sendEvidence(NeighborState &s, int targetId, bool viaCusum, simtime_t t);
+    void onEvidenceReceived(EvidenceMsg *ev);
     void raiseEvent(NeighborState &s, int targetId, bool viaCusum,
                     bool targetSpoofed, simtime_t t);
 
@@ -124,6 +152,8 @@ Define_Module(UAV);
 UAV::~UAV()
 {
     cancelAndDelete(stateTimer);
+    for (auto *ev : pendingEvidence)
+        delete ev;
 }
 
 void UAV::initialize()
@@ -168,6 +198,27 @@ void UAV::initialize()
     cusumStatSig       = registerSignal("cusumStat");
     persistRunSig      = registerSignal("persistRun");
     obsSpoofedEventSig = registerSignal("eventWhileObserverSpoofed");
+
+    evidenceCooldown = par("evidenceCooldown").doubleValue();
+    sigDelay         = par("sigDelay").doubleValue();
+    maxEvidenceAge   = par("maxEvidenceAge").doubleValue();
+
+    evSentSig       = registerSignal("evidenceSent");
+    evSuppressedSig = registerSignal("evidenceSuppressed");
+    evAcceptedSig   = registerSignal("evidenceAccepted");
+    evRejectedSig   = registerSignal("evidenceRejected");
+    evLatencySig    = registerSignal("evidenceLatency");
+    evObserversSig  = registerSignal("evidenceObservers");
+
+    // find the port that leads to this cluster's leader
+    if (!isLeader) {
+        for (int i = 0; i < gateSize("port"); i++) {
+            cModule *peer = gate("port$o", i)->getPathEndGate()->getOwnerModule();
+            if (peer->par("isLeader").boolValue()) { leaderPort = i; break; }
+        }
+        if (leaderPort < 0)
+            throw cRuntimeError("UAV %d has no link to its cluster leader", globalId);
+    }
 
     double ang = par("attackAngle").doubleValue() * M_PI / 180.0;  // deg -> rad
     attackDir  = Vec2(std::cos(ang), std::sin(ang));
@@ -305,19 +356,121 @@ void UAV::raiseEvent(NeighborState &s, int targetId, bool viaCusum,
         emit(viaCusum ? cusumFalseSig : persFalseSig, 1.0);   // both clean: false alarm
     }
 
+    // Step 4: report the event to the cluster leader (rate-limited per target)
+    sendEvidence(s, targetId, viaCusum, t);
+
     // restart the rule so a new event needs fresh evidence
     if (viaCusum) s.cusum = 0;
     else          s.persistCount = 0;
 }
 
+// Model of a digital signature: a keyed hash over the package contents.
+// Only the signer knows its key, so a package altered or forged by someone else
+// fails verification. (A real system would use e.g. ECDSA; see Limitations.)
+uint64_t UAV::computeSignature(const EvidenceMsg *ev, int signerId) const
+{
+    std::string m = "key-" + std::to_string(signerId) + "|" +
+        std::to_string(ev->getObserverId()) + "|" + std::to_string(ev->getTargetId()) + "|" +
+        std::to_string(ev->getTimestamp().dbl()) + "|" +
+        std::to_string(ev->getTargetPosX()) + "|" + std::to_string(ev->getTargetPosY()) + "|" +
+        std::to_string(ev->getObsPosX())    + "|" + std::to_string(ev->getObsPosY())    + "|" +
+        std::to_string(ev->getRMot()) + "|" + std::to_string(ev->getRRel()) + "|" +
+        std::to_string(ev->getAnomaly());
+    return (uint64_t)std::hash<std::string>{}(m);
+}
+
+void UAV::sendEvidence(NeighborState &s, int targetId, bool viaCusum, simtime_t t)
+{
+    // cooldown: one ongoing attack must not flood the leader
+    if (s.evSentBefore && simTime() - s.lastEvidence < evidenceCooldown) {
+        emit(evSuppressedSig, 1.0);
+        return;
+    }
+    s.evSentBefore = true;
+    s.lastEvidence = simTime();
+
+    EvidenceMsg *ev = new EvidenceMsg("evidence");
+    ev->setObserverId(globalId);
+    ev->setTargetId(targetId);
+    ev->setClusterId(clusterId);
+    ev->setTimestamp(t);                          // time of the sample that raised the event
+    ev->setTargetPosX(s.evSample.pos.x);  ev->setTargetPosY(s.evSample.pos.y);
+    ev->setTargetVelX(s.evSample.vel.x);  ev->setTargetVelY(s.evSample.vel.y);
+    Vec2 ownPos = ownPositionAt(t);
+    ev->setObsPosX(ownPos.x);             ev->setObsPosY(ownPos.y);
+    ev->setObsVelX(insVel.x);             ev->setObsVelY(insVel.y);
+    ev->setRMot(s.evRMot);
+    ev->setRRel(s.evRRel);
+    ev->setAnomaly(s.lastA);
+    ev->setViaCusum(viaCusum);
+    ev->setCusumValue(s.cusum);
+    ev->setPersistCount(s.persistCount);
+    ev->setTruthTargetSpoofed(s.truthSeen);       // scoring only
+    ev->setSignature(computeSignature(ev, globalId));
+    ev->setByteLength(176);                       // modelled size incl. a 64-byte signature
+
+    emit(evSentSig, 1.0);
+
+    // signing takes sigDelay; then the package goes to the leader
+    if (leaderPort >= 0)
+        sendDelayed(ev, sigDelay, "port$o", leaderPort);
+    else
+        scheduleAt(simTime() + sigDelay, ev);     // I am the leader: deliver to myself
+}
+
+void UAV::onEvidenceReceived(EvidenceMsg *ev)
+{
+    // only cluster leaders collect evidence
+    if (!isLeader) { delete ev; return; }
+
+    // 1. signature check (recompute with the claimed observer's key)
+    bool sigOk   = (ev->getSignature() == computeSignature(ev, ev->getObserverId()));
+    // 2. freshness check
+    bool fresh   = (simTime() - ev->getTimestamp() <= maxEvidenceAge);
+    // 3. it must come from this cluster
+    bool ownClus = (ev->getClusterId() == clusterId);
+
+    if (!sigOk || !fresh || !ownClus) {
+        emit(evRejectedSig, 1.0);
+        EV_WARN << "Leader " << globalId << ": rejected evidence from " << ev->getObserverId()
+                << (sigOk ? "" : " [bad signature]") << (fresh ? "" : " [stale]")
+                << (ownClus ? "" : " [wrong cluster]") << "\n";
+        delete ev;
+        return;
+    }
+
+    emit(evAcceptedSig, 1.0);
+    emit(evLatencySig, (simTime() - ev->getTimestamp()).dbl());
+
+    // how many distinct observers currently accuse this target?
+    auto &accusers = evidenceBy[ev->getTargetId()];
+    accusers[ev->getObserverId()] = simTime();
+    int recent = 0;
+    for (auto &kv : accusers)
+        if (simTime() - kv.second <= evidenceCooldown * 2) recent++;
+    emit(evObserversSig, (double)recent);
+
+    EV_INFO << "Leader " << globalId << ": evidence against UAV " << ev->getTargetId()
+            << " from UAV " << ev->getObserverId() << " (A=" << ev->getAnomaly()
+            << ", " << recent << " observers)\n";
+
+    pendingEvidence.push_back(ev);                // Phase 3 will consume these
+}
+
 void UAV::handleMessage(cMessage *msg)
 {
-    if (msg->isSelfMessage()) {
-        onTick();                       // our own timer fired
+    if (msg == stateTimer) {
+        onTick();                                   // our own timer fired
+    }
+    else if (auto *ev = dynamic_cast<EvidenceMsg *>(msg)) {
+        onEvidenceReceived(ev);                     // takes ownership (stores or deletes)
+    }
+    else if (auto *st = dynamic_cast<StateMsg *>(msg)) {
+        onStateReceived(st);
+        delete st;                                  // we own every received message
     }
     else {
-        onStateReceived(check_and_cast<StateMsg *>(msg));
-        delete msg;                     // we own every received message
+        throw cRuntimeError("Unexpected message '%s'", msg->getName());
     }
 }
 
@@ -432,6 +585,11 @@ void UAV::onStateReceived(StateMsg *msg)
             // Eq. 4.7
             double A = w1 * rMot / sigmaM + w2 * rRel / sigmaR;
             s.lastA = A;
+
+            // kept for the evidence package (Step 4)
+            s.evSample = cur;
+            s.evRMot   = rMot;
+            s.evRRel   = rRel;
 
             emit(motResSig, rMot);
             emit(relResSig, rRel);

@@ -31,10 +31,11 @@ PROJECTRELATIVE_PATH =
 O = $(PROJECT_OUTPUT_DIR)/$(CONFIGNAME)/$(PROJECTRELATIVE_PATH)
 
 # Object files for local .cc, .msg and .sm files
-OBJS = $O/UAV.o $O/StateMsg_m.o
+OBJS = $O/UAV.o $O/EvidenceMsg_m.o $O/StateMsg_m.o
 
 # Message files
 MSGFILES = \
+    EvidenceMsg.msg \
     StateMsg.msg
 
 # SM files

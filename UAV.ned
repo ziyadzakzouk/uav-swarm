@@ -48,6 +48,24 @@ simple UAV
         double cusumKappa = default(2.2);    // slack, just above benign mean of A
         double cusumH = default(60);         // alarm limit
 
+        // Stage 2.2 Step 4: evidence package
+        double evidenceCooldown @unit(s) = default(10s); // min. time between packages about one target
+        double sigDelay @unit(s)         = default(1ms); // modelled signing time
+        double maxEvidenceAge @unit(s)   = default(2s);  // leader rejects older packages
+
+        @signal[evidenceSent](type=double);
+        @statistic[evidenceSent](record=count);
+        @signal[evidenceSuppressed](type=double);        // events not sent because of the cooldown
+        @statistic[evidenceSuppressed](record=count);
+        @signal[evidenceAccepted](type=double);          // leader only
+        @statistic[evidenceAccepted](record=count);
+        @signal[evidenceRejected](type=double);          // leader only
+        @statistic[evidenceRejected](record=count);
+        @signal[evidenceLatency](type=double);           // sample time -> accepted at leader (s)
+        @statistic[evidenceLatency](record=stats);
+        @signal[evidenceObservers](type=double);         // distinct accusers of a target
+        @statistic[evidenceObservers](record=max,vector);
+
 		@signal[anomalyObserverSpoofed](type=double);
 		@statistic[anomalyObserverSpoofed](record=stats,histogram,vector);
 		
